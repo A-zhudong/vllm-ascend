@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreSendingThread,
     KVTransferThread,
 )
+
 from vllm_ascend.observability.kvpool_request_profiler import extract_request_id, kvpool_request_profiler
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -97,12 +98,6 @@ class KVPoolWorker:
             self.put_step = self.tp_size // self.num_kv_head
             self.head_or_tp_rank = self.tp_rank // self.put_step
         else:
-            self.head_or_tp_rank = self.tp_rank
-            self.put_step = 1
-
-        soc_version = get_ascend_device_type()
-        # be removed later
-        if self.backend == "mooncake" and soc_version in {AscendDeviceType.A3}:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
 

@@ -42,7 +42,6 @@ from vllm_ascend.utils import (
     flashcomm2_enable,
     get_ascend_device_type,
     is_moe_model,
-    is_vl_model,
     refresh_block_size,
     update_aclgraph_sizes,
     update_cudagraph_capture_sizes,
@@ -173,6 +172,20 @@ class NPUPlatform(Platform):
         return torch.inference_mode()
 
     @classmethod
+    def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_block_size:
+            # User specified --block-size; keep it.
+            return
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.is_hybrid:
+            # Hybrid attention+mamba models rely on the model-specific sizing
+            # logic rather than the generic platform default.
+            return
+
+        super().update_block_size_for_backend(vllm_config)
+
+    @classmethod
     def set_device(cls, device: torch.device):
         torch.npu.set_device(device)
 
@@ -224,11 +237,15 @@ class NPUPlatform(Platform):
 
         from vllm.config.compilation import CUDAGraphMode
 
-        if ascend_config.xlite_graph_config.enabled and ascend_config.xlite_graph_config.full_mode:
-            logger.info("ACLGraph is disabled under xlite full mode")
-            enforce_eager = True
-            model_config.enforce_eager = True
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if ascend_config.xlite_graph_config.enabled:
+            if ascend_config.xlite_graph_config.full_mode:
+                logger.info("ACLGraph is disabled under xlite full mode")
+                enforce_eager = True
+                model_config.enforce_eager = True
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            else:
+                logger.info("Falling back to FULL_DECODE_ONLY under xlite decode-only mode")
+                compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
         if enforce_eager:
             logger.info("Compilation disabled, using eager mode by default")
@@ -402,11 +419,6 @@ class NPUPlatform(Platform):
             vllm_config.parallel_config.cp_kv_cache_interleave_size = cache_config.block_size
 
         if enable_sp(vllm_config):
-            assert not is_vl_model(vllm_config), """Flash Comm V1 is not supported for VL models. \
-                Please disable it by setting VLLM_ASCEND_ENABLE_FLASHCOMM1=0. \
-                For optimal performance with VL models, we recommend enabling Sequence Parallelism \
-                via --compilation-config '{"pass_config": {"enable_sp": true}}'."""
-
             assert vllm_config.parallel_config.tensor_parallel_size > 1, (
                 "Flash Comm v1 is only supported when tp_size > 1."
             )
@@ -539,7 +551,7 @@ class NPUPlatform(Platform):
         attn_metadata: dict[str, Any],
         vllm_config: VllmConfig,
         dp_metadata,
-        virtual_engine: int = 0,
+        virtual_engine: int = 0,  # ToDo:: Remove me when upgrade to vllm 0.19.0 from 0.18.0
         num_tokens: int = 0,
         num_tokens_across_dp: torch.Tensor | None = None,
         cudagraph_runtime_mode=None,
@@ -590,11 +602,12 @@ class NPUPlatform(Platform):
         if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
             return {}
 
+        # is_draft_model will be removed later, so we set it to False temporarily.
+        is_draft_model = False
         moe_comm_type = select_moe_comm_method(
             num_tokens,
             vllm_config,
-            # is_draft_model will be removed later, so we set it to False temporarily.
-            is_draft_model=False,
+            is_draft_model=is_draft_model,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 
@@ -621,7 +634,7 @@ class NPUPlatform(Platform):
 
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
         flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
-        pad_size = None
+        pad_size = 0
         padded_length = None
         if flash_comm_v1_enabled or flashcomm_v2_enabled:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
@@ -658,6 +671,7 @@ class NPUPlatform(Platform):
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
             "mc2_mask": mc2_mask,
+            "is_draft_model": is_draft_model,
         }
 
     @staticmethod

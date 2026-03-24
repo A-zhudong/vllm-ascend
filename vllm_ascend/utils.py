@@ -23,6 +23,7 @@ import atexit
 import functools
 import math
 import os
+import re
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -62,7 +63,7 @@ _CP_CHUNKEDPREFILL_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
-_DYNAMIC_EPLB_BUFFER_SIZE = 1  # num_experts * num_layers * 64 byte
+_DYNAMIC_EPLB_BUFFER_SIZE = 100
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
 _IS_VL_MODEL = None
@@ -258,10 +259,22 @@ def enable_custom_op():
     Enable lazy init for vllm_ascend_C to avoid early initialization of CANN's RTS component.
     Ensure that ASCEND_RT_VISIBLE_DEVICES can be dynamically modified before torch.npu.set_device().
     """
+    from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+
     global _CUSTOM_OP_ENABLED
 
     if _CUSTOM_OP_ENABLED is not None:
         return _CUSTOM_OP_ENABLED
+
+    # There are some customed operators which aren't implemented
+    # with batch invariant in vllm-ascend, we need to disable them.
+    # FIXME(linfeng): Currently custom op compilation and execution are partially available
+    # in ASCEND950 chip, we temporarily disable all custom ops. Please refer to
+    # https://github.com/vllm-project/vllm-ascend/issues/7157 for latest update about custom op.
+    if vllm_is_batch_invariant() or get_ascend_device_type() == AscendDeviceType.A5:
+        _CUSTOM_OP_ENABLED = False
+        return _CUSTOM_OP_ENABLED
+
     try:
         # isort: off
         # register custom ops into torch_library here
@@ -476,7 +489,10 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     resources_per_graph = num_hidden_layers + 1
     # For suffix decoding, use the suffix path when no draft_model_config is provided.
     if (spec := vllm_config.speculative_config) and (draft := spec.draft_model_config):
-        resources_per_graph += draft.hf_config.num_hidden_layers + 1
+        # Use get_total_num_hidden_layers() to correctly handle MTP models,
+        # which store layer count in num_nextn_predict_layers or
+        # mtp_num_hidden_layers (for Qwen3.5) instead of num_hidden_layers.
+        resources_per_graph += draft.get_total_num_hidden_layers() + 1
 
     # TODO: Find out whether we need to take into account the pp_size
     num_comm_groups = sum(
@@ -588,6 +604,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm.model_executor.custom_op import CustomOp
 
     from vllm_ascend.ops.activation import AscendQuickGELU, AscendSiluAndMul
+    from vllm_ascend.ops.conv import AscendConv2dLayer, AscendConv3dLayer
     from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE, AscendSharedFusedMoE
     from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
@@ -636,13 +653,20 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "MMEncoderAttention": AscendMMEncoderAttention,
         "ApplyRotaryEmb": AscendApplyRotaryEmb,
         "RMSNormGated": AscendRMSNormGated,
+        "Conv2dLayer": AscendConv2dLayer,
+        "Conv3dLayer": AscendConv3dLayer,
     }
 
     # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)
     if is_310p():
         from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310, AscendSharedFusedMoE310
         from vllm_ascend._310p.ops.activation import AscendSiluAndMul310
-        from vllm_ascend._310p.ops.layernorm import AscendGemmaRMSNorm310, AscendRMSNorm310
+        from vllm_ascend._310p.ops.layernorm import (
+            AscendGemmaRMSNorm310,
+            AscendRMSNorm310,
+            AscendRMSNormGated310,
+        )
+        from vllm_ascend._310p.ops.mm_encoder_attention import AscendMMEncoderAttention310
         from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
         from vllm_ascend._310p.ops.vocab_parallel_embedding import (
             AscendParallelLMHead310,
@@ -655,10 +679,12 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "RotaryEmbedding": AscendRotaryEmbedding310,
                 "RMSNorm": AscendRMSNorm310,
                 "GemmaRMSNorm": AscendGemmaRMSNorm310,
+                "RMSNormGated": AscendRMSNormGated310,
                 "FusedMoE": AscendFusedMoE310,
                 "SharedFusedMoE": AscendSharedFusedMoE310,
                 "ParallelLMHead": AscendParallelLMHead310,
                 "VocabParallelEmbedding": AscendVocabParallelEmbedding310,
+                "MMEncoderAttention": AscendMMEncoderAttention310,
             }
         )
 
@@ -824,15 +850,29 @@ def _is_contain_expert(config: Any):
 
 
 def is_vl_model(vllm_config: VllmConfig):
-    """Checks if the model is a VL model by config"""
+    """Checks if the model is a VL model by config.
+
+    Uses the same criterion as vllm itself (model_config.py): a model is
+    multimodal when its top-level hf_config differs from its hf_text_config
+    (i.e. there is a separate vision sub-config).  The legacy key-name checks
+    are kept as fallbacks for configs that override get_text_config() to return
+    self (rare but possible).
+    """
     global _IS_VL_MODEL
     if _IS_VL_MODEL is None and vllm_config and vllm_config.model_config:
-        hf_config = vllm_config.model_config.hf_config.to_dict()
-        if "thinker_config" in hf_config:
-            # Qwen-Omni-thinker models
+        model_config = vllm_config.model_config
+        # Primary: vllm's own VL detection — hf_config is the top-level
+        # (multimodal) config; hf_text_config is the language-model sub-config.
+        # They are the same object for pure-text models.
+        if model_config.hf_config is not model_config.hf_text_config:
             _IS_VL_MODEL = True
         else:
-            _IS_VL_MODEL = "vision_config" in hf_config
+            # Fallback: check well-known config keys
+            hf_config = model_config.hf_config.to_dict()
+            if "thinker_config" in hf_config or "vision_config" in hf_config:
+                _IS_VL_MODEL = True
+            else:
+                _IS_VL_MODEL = False
     return _IS_VL_MODEL
 
 
@@ -1058,7 +1098,11 @@ def refresh_block_size(vllm_config):
         return
 
     # TODO(MengqingCao): Remove the model_type check, after resolving the hidden error in get_kv_cache_groups.
-    if model_config.hf_text_config.model_type != "qwen3_next" and cache_config.block_size != 128:
+    if (
+        "qwen3_next" not in model_config.hf_text_config.model_type
+        and "qwen3_5" not in model_config.hf_text_config.model_type
+        and cache_config.block_size != 128
+    ):
         if cache_config.enable_prefix_caching or scheduler_config.enable_chunked_prefill:
             logger.info("Block size is set to 128 if prefix cache or chunked prefill is enabled.")
             cache_config.block_size = 128
@@ -1129,8 +1173,22 @@ def enable_dsa_cp_with_layer_shard() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
+    # because the broadcast in layer sharding needs to be overlapped with a heavy compute stream to be
+    # effectively hidden, it is enabled only during the prefill stage.
     is_prefill_instance = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_producer
     return is_prefill_instance
+
+
+@lru_cache(maxsize=1)
+def enable_dsa_cp_with_o_proj_tp() -> bool:
+    if not enable_dsa_cp():
+        return False
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    # if is PD mix stage, using original TP o_proj weight, and also need to
+    # full gather for o_proj weight for prefill stage.
+    return vllm_config.kv_transfer_config is None
 
 
 def check_gdn_layer(vllm_config) -> bool:
@@ -1146,7 +1204,71 @@ def check_gdn_layer(vllm_config) -> bool:
         return False
 
     hf_config = model_config.hf_config
-    if not hasattr(hf_config, "layer_types"):
-        return False
 
-    return "linear_attention" in hf_config.layer_types
+    # Use `or []` to prevent errors when layer_types is None
+    layer_types = getattr(hf_config, "layer_types", None) or []
+    if "linear_attention" in layer_types:
+        return True
+
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config:
+        text_layer_types = getattr(text_config, "layer_types", None) or []
+        if "linear_attention" in text_layer_types:
+            return True
+
+    return False
+
+
+def get_rope_dim(vllm_config):
+    model_config = vllm_config.model_config
+
+    if model_config.use_mla:
+        rope_dim = model_config.hf_text_config.qk_rope_head_dim
+    else:
+        rope_dim = model_config.get_head_size()
+        # For models using partial rope like Qwen3-Next.
+        if hasattr(model_config.hf_text_config, "partial_rotary_factor"):
+            rope_dim = int(rope_dim * model_config.hf_text_config.partial_rotary_factor)
+        elif hasattr(model_config.hf_text_config, "rotary_dim"):
+            rope_dim = int(model_config.hf_text_config.rotary_dim)
+
+    return rope_dim
+
+
+def calc_split_factor(num_list: list[int]):
+    total = sum(num_list)
+    split_factor_list = []
+    for num in num_list:
+        split_factor_list.append(total / num)
+    return split_factor_list
+
+
+# NOTE: The last two dimensions of ND are transferred to NZ
+def trans_nd_to_nz(cache_tensor: torch.Tensor):
+    assert len(cache_tensor.shape) >= 2
+    batch = cache_tensor.shape[:-2]
+    a, b = cache_tensor.shape[-2], cache_tensor.shape[-1]
+
+    dtype = cache_tensor.dtype
+    if dtype == torch.int8:
+        a0, b0 = 16, 32
+    else:
+        a0, b0 = 16, 16
+
+    nz_shape = list(batch) + [math.ceil(b / b0), math.ceil(a / a0), a0, b0]
+
+    # Generate the axis order for the transpose operation.
+    offset = len(cache_tensor.shape) - 2
+    base = [2, 0, 1, 3]
+    array_trans = [i for i in range(offset)] + [i + offset for i in base]
+    # Perform shape transformation and transpose operation.
+    *_, n1, m1, m0, n0 = nz_shape
+    cache_tensor = cache_tensor.reshape(nz_shape[:-4] + [m1, m0, n1, n0])
+    cache_tensor = cache_tensor.permute(*array_trans)
+    return cache_tensor
+
+
+def parse_layer_idx(prefix: str) -> int | None:
+    """Extract the layer index from a module prefix string like 'model.layers.0.self_attn'."""
+    match = re.search(r"layers\.(\d+)", prefix)
+    return int(match.group(1)) if match else None

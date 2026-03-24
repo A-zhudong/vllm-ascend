@@ -1,6 +1,7 @@
 import importlib
 import math
 import threading
+import time
 from collections.abc import Generator
 
 import torch
@@ -30,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreSendingThread,
     KVTransferThread,
 )
+from vllm_ascend.observability.kvpool_request_profiler import extract_request_id, kvpool_request_profiler
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 backend_map = {
@@ -262,6 +264,13 @@ class KVPoolWorker:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
                 continue
+            request_id = extract_request_id(request)
+            kvpool_request_profiler.record_lookup(
+                request_id=request_id,
+                prompt_tokens_total=request.token_len_chunk,
+                hit_tokens=load_spec.kvpool_cached_tokens,
+            )
+            start_ns = time.perf_counter_ns()
             token_len = request.token_len_chunk
             if (load_spec.kvpool_cached_tokens % self.block_size != 0) and (
                 load_spec.kvpool_cached_tokens == token_len - 1
@@ -299,6 +308,9 @@ class KVPoolWorker:
                         size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
                     )
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            elapsed_ns = time.perf_counter_ns() - start_ns
+            kvpool_request_profiler.add_load_time_ns(request_id, elapsed_ns)
+            kvpool_request_profiler.emit_if_ready(request_id)
 
     def wait_for_layer_load(self) -> None:
         for layerwise_retriever in self.layerwise_retrievers:

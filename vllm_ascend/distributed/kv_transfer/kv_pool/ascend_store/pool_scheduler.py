@@ -18,6 +18,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     ReqMeta,
     RequestTracker,
 )
+from vllm_ascend.observability.kvpool_request_profiler import extract_request_id, kvpool_request_profiler
 
 
 class KVPoolScheduler:
@@ -95,6 +96,14 @@ class KVPoolScheduler:
             num_external_hit_tokens,
             need_to_allocate,
         )
+        request_id = extract_request_id(request)
+        kvpool_request_profiler.record_lookup(
+            request_id=request_id,
+            prompt_tokens_total=len(request.prompt_token_ids),
+            hit_tokens=num_external_hit_tokens,
+        )
+        if num_external_hit_tokens == 0:
+            kvpool_request_profiler.emit_if_ready(request_id)
 
         if need_to_allocate <= 0:
             return 0, False
@@ -326,6 +335,7 @@ class KVPoolScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        kvpool_request_profiler.pop(extract_request_id(request))
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             return False, None
         tracker = self._request_trackers.get(request.request_id)

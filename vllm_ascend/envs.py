@@ -107,6 +107,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # JSONL output path for KV Pool request-level profiling stats.
+    # Default: ./kvpool_vllm_stats.jsonl.
+    # This variable is not sensitive.
+    "KVPOOL_VLLM_LOG": lambda: os.getenv("KVPOOL_VLLM_LOG", "./kvpool_vllm_stats.jsonl"),
 }
 
 # end-env-vars-definition

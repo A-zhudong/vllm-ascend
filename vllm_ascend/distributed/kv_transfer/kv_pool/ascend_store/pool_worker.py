@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import threading
+import time
 from collections.abc import Generator
 from typing import Any
 
@@ -49,6 +50,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
+    KVMetricWriter,
+    create_p_kv_metric_writer,
+    get_scheduled_read_tokens,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreKeyLayerRecvingThread,
@@ -133,6 +139,22 @@ class KVPoolWorker:
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra_config.get("load_async", False)
+        self._kv_metric_writer: KVMetricWriter | None = create_p_kv_metric_writer("worker", self.kv_role)
+        if self._kv_metric_writer is not None:
+            self._kv_metric_writer.write(
+                "p_kv_config",
+                component="worker",
+                backend=extra_config.get("backend", "mooncake"),
+                load_async=self.load_async,
+                use_layerwise=self.use_layerwise,
+                dp_rank=self.dp_rank,
+                pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
+            )
+            logger.info(
+                "P-side KV metrics enabled; worker output=%s",
+                self._kv_metric_writer.path,
+            )
         self._invalid_block_ids: set[int] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
@@ -345,6 +367,9 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
+                    kv_metric_writer=self._kv_metric_writer,
+                    kv_metric_dp_rank=self.dp_rank,
+                    kv_metric_pp_rank=self.pp_rank,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -400,6 +425,9 @@ class KVPoolWorker:
                     self.layer_load_finished_events,
                     self.layer_save_finished_events,
                     self.num_layers,
+                    kv_metric_writer=self._kv_metric_writer,
+                    kv_metric_dp_rank=self.dp_rank,
+                    kv_metric_pp_rank=self.pp_rank,
                 )
             self.kv_recv_thread.start()
             ready_event.wait()
@@ -433,6 +461,9 @@ class KVPoolWorker:
                     ready_event,
                     invalid_block_ids=self._invalid_block_ids,
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
+                    kv_metric_writer=self._kv_metric_writer,
+                    kv_metric_dp_rank=self.dp_rank,
+                    kv_metric_pp_rank=self.pp_rank,
                 )
                 self.kv_recv_thread.start()
                 ready_event.wait()
@@ -828,6 +859,21 @@ class KVPoolWorker:
                     size_list.append(size)
                     block_id_list.append(block_id)
             if not key_list:
+                if self._kv_metric_writer is not None:
+                    self._kv_metric_writer.write(
+                        "p_kv_read",
+                        request_id=request.req_id,
+                        scheduled_read_tokens=get_scheduled_read_tokens(request),
+                        read_time_ns=0,
+                        mode="sync",
+                        outcome="empty",
+                        dp_rank=self.dp_rank,
+                        pp_rank=self.pp_rank,
+                        tp_rank=self.tp_rank,
+                        read_call_count=0,
+                        max_batch_size=1,
+                        timing_scope="request",
+                    )
                 continue
             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
             addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
@@ -841,8 +887,12 @@ class KVPoolWorker:
                 len(key_list_c),
                 key_list_c[:3],
             )
+            read_start_ns = time.perf_counter_ns() if self._kv_metric_writer is not None else 0
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self._kv_metric_writer is not None else 0
+            outcome = "ok"
             if ret is not None and any(r != 0 for r in ret):
+                outcome = "failed"
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,
                     ret,
@@ -858,6 +908,7 @@ class KVPoolWorker:
                         missing_block_ids,
                     )
             elif ret is None:
+                outcome = "failed"
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,
                     [1] * len(block_id_list_c),
@@ -879,6 +930,21 @@ class KVPoolWorker:
                 load_group_ids,
                 len(key_list_c),
             )
+            if self._kv_metric_writer is not None:
+                self._kv_metric_writer.write(
+                    "p_kv_read",
+                    request_id=request.req_id,
+                    scheduled_read_tokens=get_scheduled_read_tokens(request),
+                    read_time_ns=read_elapsed_ns,
+                    mode="sync",
+                    outcome=outcome,
+                    dp_rank=self.dp_rank,
+                    pp_rank=self.pp_rank,
+                    tp_rank=self.tp_rank,
+                    read_call_count=1,
+                    max_batch_size=1,
+                    timing_scope="request",
+                )
 
     def _process_save_for_layer_batch(
         self,

@@ -110,6 +110,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to collect P-side KV hit and external-read metrics. 0 disables
+    # collection (the default); 1 enables JSONL output. This is not sensitive.
+    "VLLM_ASCEND_KV_METRICS": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_METRICS", "0"))),
+    # Directory for P-side KV metric JSONL files. It is used only when
+    # VLLM_ASCEND_KV_METRICS=1. This is not sensitive.
+    "VLLM_ASCEND_KV_METRICS_DIR": lambda: os.getenv(
+        "VLLM_ASCEND_KV_METRICS_DIR", "/tmp/vllm_ascend_kv_metrics"
+    ),
 }
 
 # end-env-vars-definition

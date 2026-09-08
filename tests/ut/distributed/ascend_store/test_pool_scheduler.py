@@ -74,6 +74,12 @@ class TestGetZmqRpcPathLookup(unittest.TestCase):
 
 
 class TestKVPoolScheduler(unittest.TestCase):
+    @staticmethod
+    def _enable_metrics(scheduler):
+        writer = MagicMock()
+        scheduler._kv_metric_writer = writer
+        return writer
+
     def _make_config(self, kv_role="kv_producer", extra_config=None, block_size=16):
         config = MagicMock()
         config.kv_transfer_config.kv_role = kv_role
@@ -172,6 +178,7 @@ class TestKVPoolScheduler(unittest.TestCase):
     def test_get_num_new_matched_tokens_less_than_computed(self, mock_client_cls):
         config = self._make_config(block_size=16)
         scheduler = KVPoolScheduler(config, use_layerwise=False)
+        self._enable_metrics(scheduler)
         mock_client_cls.return_value.lookup.return_value = 16
 
         request = MagicMock()
@@ -182,6 +189,7 @@ class TestKVPoolScheduler(unittest.TestCase):
 
         need, _ = scheduler.get_num_new_matched_tokens(request, 32)
         self.assertEqual(need, 0)
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 32))
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_update_state_after_alloc_no_load_spec(self, mock_client_cls):
@@ -294,6 +302,162 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 48)
         self.assertTrue(is_async)
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_uses_raw_full_hit_and_emits_after_alloc(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        writer = self._enable_metrics(scheduler)
+        mock_client_cls.return_value.lookup.return_value = 64
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        need, _ = scheduler.get_num_new_matched_tokens(request, 0)
+        self.assertEqual(need, 63)
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 64))
+
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = [[0, 1, 2, 3]]
+        scheduler.update_state_after_alloc(request, blocks, 63)
+        scheduler.update_state_after_alloc(request, blocks, 63)
+
+        writer.write.assert_called_once_with(
+            "p_kv_hit",
+            request_id="r1",
+            request_tokens=64,
+            hit_tokens=64,
+        )
+        self.assertNotIn("r1", scheduler._pending_p_kv_hit_metrics)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_deduplicates_local_and_pool_hits(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        self._enable_metrics(scheduler)
+        mock_client_cls.return_value.lookup.return_value = 48
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        scheduler.get_num_new_matched_tokens(request, 16)
+
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 48))
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_records_cold_miss(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        writer = self._enable_metrics(scheduler)
+        mock_client_cls.return_value.lookup.return_value = 0
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 0))
+
+        scheduler.update_state_after_alloc(request, MagicMock(), 0)
+
+        writer.write.assert_called_once_with(
+            "p_kv_hit",
+            request_id="r1",
+            request_tokens=64,
+            hit_tokens=0,
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_records_local_hit_when_pool_lookup_is_skipped(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=64), use_layerwise=False)
+        writer = self._enable_metrics(scheduler)
+        request = MagicMock()
+        request.prompt_token_ids = list(range(32))
+        request.num_tokens = 32
+        request.request_id = "r1"
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 16), (0, False))
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (32, 16))
+
+        scheduler.update_state_after_alloc(request, MagicMock(), 0)
+
+        writer.write.assert_called_once_with(
+            "p_kv_hit",
+            request_id="r1",
+            request_tokens=32,
+            hit_tokens=16,
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_reflects_block_granularity(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=128), use_layerwise=False)
+        self._enable_metrics(scheduler)
+        mock_client_cls.return_value.lookup.return_value = 896
+        request = MagicMock()
+        request.prompt_token_ids = list(range(1000))
+        request.num_tokens = 1000
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 7
+
+        need, _ = scheduler.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(need, 896)
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (1000, 896))
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            896,
+            request.block_hashes,
+            [0],
+            hbm_hit_tokens=0,
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_retry_overwrites_pending_value(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        self._enable_metrics(scheduler)
+        mock_client_cls.return_value.lookup.side_effect = [48, 32]
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        scheduler.get_num_new_matched_tokens(request, 16)
+        scheduler.get_num_new_matched_tokens(request, 16)
+
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics, {"r1": (64, 32)})
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_is_not_recorded_on_consumer(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(kv_role="kv_consumer"), use_layerwise=False)
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.request_id = "r1"
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
+        scheduler.update_state_after_alloc(request, MagicMock(), 0)
+
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics, {})
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.create_p_kv_metric_writer",
+        return_value=None,
+    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_p_kv_hit_metric_is_not_staged_when_disabled(self, mock_client_cls, _mock_writer_factory):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        self.assertIsNone(scheduler._kv_metric_writer)
+        mock_client_cls.return_value.lookup.return_value = 32
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(scheduler._pending_p_kv_hit_metrics, {})
+
 
 class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
     def _make_config(self, kv_role="kv_producer", block_size=16):
@@ -367,6 +531,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
             allocated_block_ids=[0, 1],
         )
         scheduler._unfinished_requests["r1"] = (MagicMock(), [0, 1])
+        scheduler._pending_p_kv_hit_metrics["r1"] = (32, 16)
         scheduler._unfinished_request_ids.add("r1")
 
         sched_output = MagicMock()
@@ -379,6 +544,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
 
         _meta = scheduler.build_connector_meta(sched_output)
         self.assertNotIn("r1", scheduler._request_trackers)
+        self.assertNotIn("r1", scheduler._pending_p_kv_hit_metrics)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_build_connector_meta_consumer_skip_save(self, mock_client_cls):
@@ -421,6 +587,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
             allocated_block_ids=[0, 1],
         )
         scheduler._unfinished_requests["r1"] = (MagicMock(), [0, 1])
+        scheduler._pending_p_kv_hit_metrics["r1"] = (32, 16)
 
         sched_output = MagicMock()
         sched_output.finished_req_ids = set()
@@ -432,6 +599,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
 
         _meta = scheduler.build_connector_meta(sched_output)
         self.assertNotIn("r1", scheduler._request_trackers)
+        self.assertNotIn("r1", scheduler._pending_p_kv_hit_metrics)
 
 
 class TestLookupKeyClient(unittest.TestCase):

@@ -14,6 +14,10 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
+    KVMetricWriter,
+    get_scheduled_read_tokens,
+)
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -312,6 +316,9 @@ class KVTransferThread(threading.Thread):
         dcp_size: int = 1,
         ready_event: threading.Event | None = None,
         name: str = "KVTransferThread",
+        kv_metric_writer: KVMetricWriter | None = None,
+        kv_metric_dp_rank: int = 0,
+        kv_metric_pp_rank: int = 0,
     ):
         super().__init__(daemon=True, name=name)
         self.m_store = m_store
@@ -328,6 +335,58 @@ class KVTransferThread(threading.Thread):
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        self.kv_metric_writer = kv_metric_writer
+        self.kv_metric_dp_rank = kv_metric_dp_rank
+        self.kv_metric_pp_rank = kv_metric_pp_rank
+        self._kv_read_elapsed_ns: dict[str, int] = {}
+        self._kv_read_call_count: defaultdict[str, int] = defaultdict(int)
+        self._kv_read_max_batch_size: defaultdict[str, int] = defaultdict(int)
+        self._kv_read_failed_requests: set[str] = set()
+
+    def record_kv_read_metrics(
+        self,
+        requests: list[ReqMeta],
+        elapsed_ns: int,
+        mode: str,
+        outcome: str,
+        final: bool,
+    ) -> None:
+        if self.kv_metric_writer is None:
+            return
+        unique_requests = {request.req_id: request for request in requests}
+        batch_size = len(unique_requests)
+        for req_id, request in unique_requests.items():
+            self._kv_read_elapsed_ns[req_id] = self._kv_read_elapsed_ns.get(req_id, 0) + elapsed_ns
+            if outcome != "empty":
+                self._kv_read_call_count[req_id] += 1
+            self._kv_read_max_batch_size[req_id] = max(self._kv_read_max_batch_size[req_id], batch_size)
+            if outcome == "failed":
+                self._kv_read_failed_requests.add(req_id)
+            if not final:
+                continue
+
+            total_elapsed_ns = self._kv_read_elapsed_ns.pop(req_id, 0)
+            read_call_count = self._kv_read_call_count.pop(req_id, 0)
+            max_batch_size = self._kv_read_max_batch_size.pop(req_id, 0)
+            if req_id in self._kv_read_failed_requests:
+                final_outcome = "failed"
+                self._kv_read_failed_requests.discard(req_id)
+            else:
+                final_outcome = "ok" if read_call_count else "empty"
+            self.kv_metric_writer.write(
+                "p_kv_read",
+                request_id=req_id,
+                scheduled_read_tokens=get_scheduled_read_tokens(request),
+                read_time_ns=total_elapsed_ns,
+                mode=mode,
+                outcome=final_outcome,
+                dp_rank=self.kv_metric_dp_rank,
+                pp_rank=self.kv_metric_pp_rank,
+                tp_rank=self.tp_rank,
+                read_call_count=read_call_count,
+                max_batch_size=max_batch_size,
+                timing_scope="shared_batch" if max_batch_size > 1 else "request",
+            )
 
     def _get_block_size(self, kv_cache_group_id: int = 0) -> int:
         if isinstance(self.block_size, list):
@@ -363,6 +422,11 @@ class KVTransferThread(threading.Thread):
     def discard_finished_requests(self, req_ids: set[str]) -> None:
         with self.done_task_lock:
             self.finished_requests -= req_ids
+        for req_id in req_ids:
+            self._kv_read_elapsed_ns.pop(req_id, None)
+            self._kv_read_call_count.pop(req_id, None)
+            self._kv_read_max_batch_size.pop(req_id, None)
+            self._kv_read_failed_requests.discard(req_id)
 
     def set_finished_request(self, req_id):
         with self.done_task_lock:
@@ -853,6 +917,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         ready_event: threading.Event | None = None,
         invalid_block_ids: set[int] | None = None,
         invalid_block_ids_lock: threading.Lock | None = None,
+        kv_metric_writer: KVMetricWriter | None = None,
+        kv_metric_dp_rank: int = 0,
+        kv_metric_pp_rank: int = 0,
     ):
         super().__init__(
             m_store,
@@ -863,6 +930,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             dcp_size,
             ready_event,
             name="KVCacheStoreRecvingThread",
+            kv_metric_writer=kv_metric_writer,
+            kv_metric_dp_rank=kv_metric_dp_rank,
+            kv_metric_pp_rank=kv_metric_pp_rank,
         )
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
@@ -915,6 +985,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 size_list.append(size)
                 block_id_list.append(block_id)
         if not key_list:
+            self.record_kv_read_metrics([req_meta], 0, "async", "empty", final=True)
             self.set_finished_request(req_id)
             self.request_queue.task_done()
             return
@@ -932,8 +1003,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             len(key_list_c),
             key_list_c[:3],
         )
+        read_start_ns = time.perf_counter_ns() if self.kv_metric_writer is not None else 0
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self.kv_metric_writer is not None else 0
+        outcome = "ok"
         if ret is not None and any(r != 0 for r in ret):
+            outcome = "failed"
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
                 ret,
@@ -950,6 +1025,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     missing_block_ids,
                 )
         elif ret is None:
+            outcome = "failed"
             missing_block_ids = record_failed_blocks(
                 block_id_list_c,
                 [1] * len(block_id_list_c),
@@ -972,6 +1048,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             req_meta.kv_cache_group_ids or [0],
             len(key_list_c),
         )
+        self.record_kv_read_metrics([req_meta], read_elapsed_ns, "async", outcome, final=True)
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
@@ -1149,6 +1226,9 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         layer_load_finished_events: list[threading.Event],
         layer_save_finished_events: list[threading.Event],
         num_layers: int,
+        kv_metric_writer: KVMetricWriter | None = None,
+        kv_metric_dp_rank: int = 0,
+        kv_metric_pp_rank: int = 0,
     ):
         super().__init__(
             m_store,
@@ -1159,6 +1239,9 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
             dcp_size,
             ready_event,
             name="KVCacheStoreKeyLayerRecvingThread",
+            kv_metric_writer=kv_metric_writer,
+            kv_metric_dp_rank=kv_metric_dp_rank,
+            kv_metric_pp_rank=kv_metric_pp_rank,
         )
         self.get_event = get_event
         self.layer_load_finished_events = layer_load_finished_events
@@ -1193,12 +1276,14 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         size_list = []
         req_ids = []
         is_last_chunks = []
+        requests: list[ReqMeta] = []
         if len(data.transfer_tasks) > 1:
             raise ValueError(f"Expected at most one layer transfer task, got {len(data.transfer_tasks)}")
         if data.transfer_tasks:
             transfer_task = data.transfer_tasks[0]
             for block_range in transfer_task.block_ranges:
                 request = block_range.request
+                requests.append(request)
                 req_ids.append(request.req_id)
                 is_last_chunks.append(request.is_last_chunk)
                 for block_index in range(block_range.start_block, block_range.end_block):
@@ -1222,12 +1307,25 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
                     addr_list.append(addr)
                     size_list.append(size)
 
+        read_elapsed_ns = 0
+        outcome = "empty"
         if key_list:
             shift = (self.tp_rank * len(key_list)) // self.tp_size
             key_list_c = _circular_shift(key_list, shift)
             addr_list_c = _circular_shift(addr_list, shift)
             size_list_c = _circular_shift(size_list, shift)
-            self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            read_start_ns = time.perf_counter_ns() if self.kv_metric_writer is not None else 0
+            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self.kv_metric_writer is not None else 0
+            outcome = "failed" if ret is None or any(result != 0 for result in ret) else "ok"
+
+        self.record_kv_read_metrics(
+            requests,
+            read_elapsed_ns,
+            "layerwise_key",
+            outcome,
+            final=layer_id == self.final_layer_id,
+        )
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -1262,6 +1360,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         group_builders: list[LayerBatchBuilder] | None = None,
+        kv_metric_writer: KVMetricWriter | None = None,
+        kv_metric_dp_rank: int = 0,
+        kv_metric_pp_rank: int = 0,
     ):
         super().__init__(
             m_store,
@@ -1429,6 +1530,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             dcp_size,
             ready_event,
             name="KVCacheStoreLayerRecvingThread",
+            kv_metric_writer=kv_metric_writer,
+            kv_metric_dp_rank=kv_metric_dp_rank,
+            kv_metric_pp_rank=kv_metric_pp_rank,
         )
         self.get_event = get_event
         self.layer_load_finished_events = layer_load_finished_events
@@ -1484,6 +1588,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
         attention_start_gate = data.attention_start_gate
+        requests = [block_range.request for task in transfer_tasks for block_range in task.block_ranges]
 
         if len(transfer_tasks) == 0:
             if wait_for_save is not None:
@@ -1511,6 +1616,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 task_metas.append((task, req_meta))
 
         if not task_metas:
+            self.record_kv_read_metrics(
+                requests,
+                0,
+                "layerwise_gva",
+                "empty",
+                final=layer_id == self.final_layer_id,
+            )
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             self.layer_load_finished_events[layer_id].set()
@@ -1548,13 +1660,28 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
         addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
-        res = self._batch_copy_with_limits(
-            gvas_array,
-            addr_array,
-            size_array,
-            1,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
+        read_elapsed_ns = 0
+        outcome = "empty"
+        if len(gvas_array):
+            read_start_ns = time.perf_counter_ns() if self.kv_metric_writer is not None else 0
+            res = self._batch_copy_with_limits(
+                gvas_array,
+                addr_array,
+                size_array,
+                1,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
+            )
+            read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self.kv_metric_writer is not None else 0
+            outcome = "ok" if res == 0 else "failed"
+        else:
+            res = 0
+        self.record_kv_read_metrics(
+            requests,
+            read_elapsed_ns,
+            "layerwise_gva",
+            outcome,
+            final=layer_id == self.final_layer_id,
         )
         if layer_id <= 2 or res != 0:
             logger.debug(

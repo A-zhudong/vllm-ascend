@@ -42,6 +42,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_group_cache_families,
     normalize_block_ids_by_group,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
+    KVMetricWriter,
+    create_p_kv_metric_writer,
+)
 
 
 class KVPoolScheduler:
@@ -129,6 +133,21 @@ class KVPoolScheduler:
         if self.use_layerwise:
             self._discard_partial_chunks = vllm_config.kv_transfer_config.get_from_extra_config(
                 "discard_partial_chunks", True
+            )
+        # request_id -> (prompt tokens, deduplicated KV hit tokens)
+        self._pending_p_kv_hit_metrics: dict[str, tuple[int, int]] = {}
+        self._kv_metric_writer: KVMetricWriter | None = create_p_kv_metric_writer("scheduler", self.kv_role)
+        if self._kv_metric_writer is not None:
+            self._kv_metric_writer.write(
+                "p_kv_config",
+                component="scheduler",
+                block_sizes=self.original_block_size,
+                cache_transfer_granularity=self.cache_transfer_granularity,
+                discard_partial_chunks=self._discard_partial_chunks,
+            )
+            logger.info(
+                "P-side KV metrics enabled; scheduler output=%s",
+                self._kv_metric_writer.path,
             )
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
@@ -428,6 +447,37 @@ class KVPoolScheduler:
     def _floor_to_cache_transfer_granularity(self, token_len: int) -> int:
         return token_len // self.cache_transfer_granularity * self.cache_transfer_granularity
 
+    def _stage_p_kv_hit_metric(
+        self,
+        request: "Request",
+        local_hit_tokens: int,
+        pool_hit_tokens: int,
+    ) -> None:
+        if self._kv_metric_writer is None:
+            return
+        request_tokens = len(request.prompt_token_ids)
+        hit_tokens = min(
+            request_tokens,
+            max(max(int(local_hit_tokens), 0), max(int(pool_hit_tokens), 0)),
+        )
+        self._pending_p_kv_hit_metrics[request.request_id] = (
+            request_tokens,
+            hit_tokens,
+        )
+
+    def _emit_p_kv_hit_metric(self, request_id: str) -> None:
+        metric = self._pending_p_kv_hit_metrics.pop(request_id, None)
+        if metric is None:
+            return
+        request_tokens, hit_tokens = metric
+        assert self._kv_metric_writer is not None
+        self._kv_metric_writer.write(
+            "p_kv_hit",
+            request_id=request_id,
+            request_tokens=request_tokens,
+            hit_tokens=hit_tokens,
+        )
+
     @staticmethod
     def _uses_hybrid_kv_cache(vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig | None) -> bool:
         if kv_cache_config is None:
@@ -514,6 +564,7 @@ class KVPoolScheduler:
             and not self.use_layerwise
             and prompt_token_len < 2 * self.retention_interval
         ):
+            self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
             return 0, False
 
         if self.use_gva_layerwise:
@@ -526,6 +577,7 @@ class KVPoolScheduler:
                 token_len = prompt_token_len
 
             if token_len < self.cache_transfer_granularity:
+                self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
                 return 0, False
 
             if self.use_layerwise:
@@ -534,6 +586,7 @@ class KVPoolScheduler:
                 )
             else:
                 if num_computed_tokens >= token_len:
+                    self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
                     return 0, False
                 if self.client is None:
                     self.client = LookupKeyClient(self.vllm_config)
@@ -545,9 +598,11 @@ class KVPoolScheduler:
                 )
 
         if num_external_hit_tokens == 0:
+            self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
+        self._stage_p_kv_hit_metric(request, num_computed_tokens, store_skip_tokens)
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
@@ -603,6 +658,7 @@ class KVPoolScheduler:
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
+        self._emit_p_kv_hit_metric(request.request_id)
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
             logger.debug(
@@ -920,6 +976,7 @@ class KVPoolScheduler:
         force_skip_save = self.kv_role == "kv_consumer" and not self.consumer_is_to_put
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            self._pending_p_kv_hit_metrics.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
@@ -928,6 +985,7 @@ class KVPoolScheduler:
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
+            self._pending_p_kv_hit_metrics.pop(req_id, None)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
             self._loading_req_ids.discard(req_id)

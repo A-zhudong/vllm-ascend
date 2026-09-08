@@ -1065,6 +1065,63 @@ and the worker process. Each instance must use a unique port value.
 
 #### [2. Run Inference](#2-run-inference)
 
+## P-side KV Hit and External-read Metrics
+
+This optional diagnostic is disabled by default. Enable it only on the P
+instance before starting vLLM:
+
+```bash
+export VLLM_ASCEND_KV_METRICS=1
+export VLLM_ASCEND_KV_METRICS_DIR=/data/logs/vllm-kv-metrics
+```
+
+`VLLM_ASCEND_KV_METRICS_DIR` defaults to
+`/tmp/vllm_ascend_kv_metrics`. The directory must be writable by every vLLM
+scheduler and worker process. In containers, mount a persistent volume if the
+files must survive a restart. When TP workers run on multiple nodes, collect
+the files from every node before aggregation. Use a fresh directory for each
+test window because these append-only files are not rotated by vLLM.
+
+The diagnostic writes one JSON object per line to process-specific files:
+
+```text
+p_kv_metrics.scheduler.<hostname>.<pid>.jsonl
+p_kv_metrics.worker.<hostname>.<pid>.jsonl
+```
+
+The scheduler file contains `p_kv_hit` events with `request_tokens` and the
+deduplicated P-side prefix frontier `hit_tokens`. The worker files contain
+`p_kv_read` events with `scheduled_read_tokens`, `read_time_ns`, `mode`,
+`outcome`, and DP/PP/TP ranks.
+
+`read_time_ns` covers the external backend `get` or layerwise G2L copy call.
+It excludes lookup, queueing, scheduling, and prefill computation, and it is
+not pure HBM access time. If a backend call returns before asynchronous work
+finishes, the metric ends at that return and does not include later backend
+completion. `scheduled_read_tokens` is the planned external transfer range,
+not a confirmed successful-token count. For a multi-rank request, the
+aggregation script reports the maximum rank time as the observed request read
+latency. When `timing_scope=shared_batch`, the timed call served multiple
+requests and is not exclusively attributable to one request.
+
+Aggregate all JSONL files in the directory with:
+
+```bash
+python tools/extract_p_kv_metrics.py \
+  --input-dir /data/logs/vllm-kv-metrics \
+  --output-dir /data/logs/vllm-kv-metrics/report
+```
+
+The command writes:
+
+```text
+report/p_kv_request_metrics.csv
+report/p_kv_summary.json
+```
+
+Set `VLLM_ASCEND_KV_METRICS=0` or leave it unset, then restart vLLM, to disable
+both collection and file creation.
+
 ## FAQ
 
 ### 1. Mooncake FAQ

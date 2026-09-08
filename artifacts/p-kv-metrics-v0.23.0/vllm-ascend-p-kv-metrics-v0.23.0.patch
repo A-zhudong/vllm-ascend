@@ -1,0 +1,1461 @@
+diff --git a/docs/source/user_guide/feature_guide/kv_pool.md b/docs/source/user_guide/feature_guide/kv_pool.md
+index e9e8526c..c7647120 100644
+--- a/docs/source/user_guide/feature_guide/kv_pool.md
++++ b/docs/source/user_guide/feature_guide/kv_pool.md
+@@ -1065,6 +1065,63 @@ and the worker process. Each instance must use a unique port value.
+ 
+ #### [2. Run Inference](#2-run-inference)
+ 
++## P-side KV Hit and External-read Metrics
++
++This optional diagnostic is disabled by default. Enable it only on the P
++instance before starting vLLM:
++
++```bash
++export VLLM_ASCEND_KV_METRICS=1
++export VLLM_ASCEND_KV_METRICS_DIR=/data/logs/vllm-kv-metrics
++```
++
++`VLLM_ASCEND_KV_METRICS_DIR` defaults to
++`/tmp/vllm_ascend_kv_metrics`. The directory must be writable by every vLLM
++scheduler and worker process. In containers, mount a persistent volume if the
++files must survive a restart. When TP workers run on multiple nodes, collect
++the files from every node before aggregation. Use a fresh directory for each
++test window because these append-only files are not rotated by vLLM.
++
++The diagnostic writes one JSON object per line to process-specific files:
++
++```text
++p_kv_metrics.scheduler.<hostname>.<pid>.jsonl
++p_kv_metrics.worker.<hostname>.<pid>.jsonl
++```
++
++The scheduler file contains `p_kv_hit` events with `request_tokens` and the
++deduplicated P-side prefix frontier `hit_tokens`. The worker files contain
++`p_kv_read` events with `scheduled_read_tokens`, `read_time_ns`, `mode`,
++`outcome`, and DP/PP/TP ranks.
++
++`read_time_ns` covers the external backend `get` or layerwise G2L copy call.
++It excludes lookup, queueing, scheduling, and prefill computation, and it is
++not pure HBM access time. If a backend call returns before asynchronous work
++finishes, the metric ends at that return and does not include later backend
++completion. `scheduled_read_tokens` is the planned external transfer range,
++not a confirmed successful-token count. For a multi-rank request, the
++aggregation script reports the maximum rank time as the observed request read
++latency. When `timing_scope=shared_batch`, the timed call served multiple
++requests and is not exclusively attributable to one request.
++
++Aggregate all JSONL files in the directory with:
++
++```bash
++python tools/extract_p_kv_metrics.py \
++  --input-dir /data/logs/vllm-kv-metrics \
++  --output-dir /data/logs/vllm-kv-metrics/report
++```
++
++The command writes:
++
++```text
++report/p_kv_request_metrics.csv
++report/p_kv_summary.json
++```
++
++Set `VLLM_ASCEND_KV_METRICS=0` or leave it unset, then restart vLLM, to disable
++both collection and file creation.
++
+ ## FAQ
+ 
+ ### 1. Mooncake FAQ
+diff --git a/tests/ut/distributed/ascend_store/test_kv_metrics.py b/tests/ut/distributed/ascend_store/test_kv_metrics.py
+new file mode 100644
+index 00000000..03d9f6f7
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_kv_metrics.py
+@@ -0,0 +1,276 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++import json
++import threading
++from unittest.mock import MagicMock, patch
++
++# isort: off
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
++from tests.ut.distributed.ascend_store.test_kv_transfer import (
++    FakeStore,
++    FakeTokenDatabase,
++)
++from tools.extract_p_kv_metrics import summarize_records
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
++    kv_metrics as kv_metrics_module,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
++    kv_transfer as kv_transfer_module,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
++    pool_worker as pool_worker_module,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
++    AscendConnectorMetadata,
++    LoadSpec,
++    ReqMeta,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
++    create_p_kv_metric_writer,
++    get_scheduled_read_tokens,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
++    KVCacheStoreRecvingThread,
++    KVTransferThread,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
++    KVPoolWorker,
++)
++# isort: on
++
++
++def _request(
++    vllm_cached_tokens: int = 32,
++    kvpool_cached_tokens: int = 96,
++    token_len: int = 96,
++) -> ReqMeta:
++    return ReqMeta(
++        req_id="request-1",
++        token_len_chunk=token_len,
++        block_ids=[0, 1],
++        block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
++        load_spec=LoadSpec(
++            vllm_cached_tokens=vllm_cached_tokens,
++            kvpool_cached_tokens=kvpool_cached_tokens,
++            can_load=True,
++            token_len=token_len,
++        ),
++    )
++
++
++def test_metrics_default_to_disabled():
++    with patch.object(kv_metrics_module.envs, "VLLM_ASCEND_KV_METRICS", False):
++        assert create_p_kv_metric_writer("scheduler", "kv_producer") is None
++
++
++def test_metric_writer_uses_dedicated_directory(tmp_path):
++    with (
++        patch.object(kv_metrics_module.envs, "VLLM_ASCEND_KV_METRICS", True),
++        patch.object(kv_metrics_module.envs, "VLLM_ASCEND_KV_METRICS_DIR", str(tmp_path)),
++    ):
++        writer = create_p_kv_metric_writer("scheduler", "kv_producer")
++        assert writer is not None
++        writer.write("p_kv_hit", request_id="r1", request_tokens=64, hit_tokens=32)
++
++    files = list(tmp_path.glob("p_kv_metrics.scheduler.*.jsonl"))
++    assert len(files) == 1
++    record = json.loads(files[0].read_text(encoding="utf-8"))
++    assert record["event"] == "p_kv_hit"
++    assert record["request_id"] == "r1"
++    assert record["hit_tokens"] == 32
++
++
++def test_scheduled_read_tokens_use_raw_full_hit_before_scheduler_decrement():
++    request = _request(vllm_cached_tokens=0, kvpool_cached_tokens=63, token_len=64)
++    request.load_spec.token_len = 0  # type: ignore[union-attr]
++    request.load_spec.kvpool_store_skip_tokens = 64  # type: ignore[union-attr]
++
++    assert get_scheduled_read_tokens(request) == 64
++
++
++def test_layerwise_read_time_accumulates_and_writes_once():
++    writer = MagicMock()
++    thread = KVTransferThread(
++        m_store=MagicMock(),
++        token_database=MagicMock(group_block_len={0: [16]}),
++        block_size=16,
++        tp_rank=2,
++        ready_event=threading.Event(),
++        kv_metric_writer=writer,
++        kv_metric_dp_rank=3,
++        kv_metric_pp_rank=1,
++    )
++    request = _request()
++
++    thread.record_kv_read_metrics([request], 1_000_000, "layerwise_gva", "ok", final=False)
++    thread.record_kv_read_metrics([request], 2_000_000, "layerwise_gva", "ok", final=True)
++
++    writer.write.assert_called_once_with(
++        "p_kv_read",
++        request_id="request-1",
++        scheduled_read_tokens=64,
++        read_time_ns=3_000_000,
++        mode="layerwise_gva",
++        outcome="ok",
++        dp_rank=3,
++        pp_rank=1,
++        tp_rank=2,
++        read_call_count=2,
++        max_batch_size=1,
++        timing_scope="request",
++    )
++    assert thread._kv_read_elapsed_ns == {}
++
++
++def test_layerwise_failure_and_shared_batch_scope_are_preserved():
++    writer = MagicMock()
++    thread = KVTransferThread(
++        m_store=MagicMock(),
++        token_database=MagicMock(group_block_len={0: [16]}),
++        block_size=16,
++        tp_rank=0,
++        kv_metric_writer=writer,
++    )
++    request_1 = _request()
++    request_2 = _request()
++    request_2.req_id = "request-2"
++
++    thread.record_kv_read_metrics([request_1, request_2], 1_000_000, "layerwise_gva", "failed", final=False)
++    thread.record_kv_read_metrics([request_1, request_2], 2_000_000, "layerwise_gva", "ok", final=True)
++
++    assert writer.write.call_count == 2
++    for call in writer.write.call_args_list:
++        assert call.kwargs["outcome"] == "failed"
++        assert call.kwargs["read_time_ns"] == 3_000_000
++        assert call.kwargs["max_batch_size"] == 2
++        assert call.kwargs["timing_scope"] == "shared_batch"
++
++
++def test_async_read_records_backend_time_for_request():
++    writer = MagicMock()
++    store = FakeStore()
++    store.get = MagicMock(return_value=[0, 0])
++    thread = KVCacheStoreRecvingThread(
++        m_store=store,
++        token_database=FakeTokenDatabase(),
++        block_size=16,
++        tp_rank=0,
++        dcp_size=1,
++        ready_event=threading.Event(),
++        invalid_block_ids=set(),
++        invalid_block_ids_lock=threading.Lock(),
++        kv_metric_writer=writer,
++    )
++    request = _request(vllm_cached_tokens=0, kvpool_cached_tokens=32, token_len=32)
++    thread.request_queue.put(request)
++
++    with patch.object(kv_transfer_module.time, "perf_counter_ns", side_effect=[100, 5_000_100]):
++        thread._handle_request(request)
++
++    assert writer.write.call_args.kwargs["read_time_ns"] == 5_000_000
++    assert writer.write.call_args.kwargs["mode"] == "async"
++    assert writer.write.call_args.kwargs["outcome"] == "ok"
++
++
++def test_sync_read_records_backend_time_for_request():
++    writer = MagicMock()
++    worker = KVPoolWorker.__new__(KVPoolWorker)
++    worker.current_layer = 0
++    worker.use_layerwise = False
++    worker.group_uses_align_state = [False]
++    worker.cache_transfer_granularity = 16
++    worker.load_async = False
++    worker.token_database = FakeTokenDatabase()
++    worker.grouped_block_size = [16]
++    worker.m_store = MagicMock()
++    worker.m_store.get.return_value = [0, 0]
++    worker._invalid_block_ids = set()
++    worker.tp_rank = 0
++    worker.dp_rank = 2
++    worker.pp_rank = 1
++    worker._kv_metric_writer = writer
++    request = _request(vllm_cached_tokens=0, kvpool_cached_tokens=32, token_len=32)
++    metadata = AscendConnectorMetadata(set(), set())
++    metadata.add_request(request)
++
++    with patch.object(pool_worker_module.time, "perf_counter_ns", side_effect=[100, 7_000_100]):
++        worker.start_load_kv(metadata)
++
++    assert writer.write.call_args.kwargs["read_time_ns"] == 7_000_000
++    assert writer.write.call_args.kwargs["mode"] == "sync"
++    assert writer.write.call_args.kwargs["outcome"] == "ok"
++
++
++def test_disabled_read_metrics_do_not_call_timer():
++    store = FakeStore()
++    store.get = MagicMock(return_value=[0, 0])
++    thread = KVCacheStoreRecvingThread(
++        m_store=store,
++        token_database=FakeTokenDatabase(),
++        block_size=16,
++        tp_rank=0,
++        dcp_size=1,
++        ready_event=threading.Event(),
++        invalid_block_ids=set(),
++        invalid_block_ids_lock=threading.Lock(),
++    )
++    request = _request(vllm_cached_tokens=0, kvpool_cached_tokens=32, token_len=32)
++    thread.request_queue.put(request)
++
++    with patch.object(kv_transfer_module.time, "perf_counter_ns") as timer:
++        thread._handle_request(request)
++
++    timer.assert_not_called()
++
++
++def test_extractor_uses_max_rank_time_and_weighted_hit_ratio():
++    rows, summary = summarize_records(
++        [
++            {
++                "timestamp_ns": 1,
++                "event": "p_kv_hit",
++                "request_id": "r1",
++                "request_tokens": 100,
++                "hit_tokens": 80,
++            },
++            {
++                "timestamp_ns": 2,
++                "event": "p_kv_read",
++                "request_id": "r1",
++                "scheduled_read_tokens": 80,
++                "read_time_ns": 2_000_000,
++                "outcome": "ok",
++                "mode": "sync",
++                "max_batch_size": 1,
++            },
++            {
++                "timestamp_ns": 3,
++                "event": "p_kv_read",
++                "request_id": "r1",
++                "scheduled_read_tokens": 80,
++                "read_time_ns": 3_000_000,
++                "outcome": "ok",
++                "mode": "sync",
++                "max_batch_size": 1,
++            },
++        ]
++    )
++
++    assert rows[0]["read_time_ms_max_rank"] == 3.0
++    assert rows[0]["read_time_ms_sum_ranks"] == 5.0
++    assert summary["weighted_hit_ratio"] == 0.8
+diff --git a/tests/ut/distributed/ascend_store/test_pool_scheduler.py b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+index 536f69ff..e8b9b53b 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_scheduler.py
++++ b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+@@ -74,6 +74,12 @@ class TestGetZmqRpcPathLookup(unittest.TestCase):
+ 
+ 
+ class TestKVPoolScheduler(unittest.TestCase):
++    @staticmethod
++    def _enable_metrics(scheduler):
++        writer = MagicMock()
++        scheduler._kv_metric_writer = writer
++        return writer
++
+     def _make_config(self, kv_role="kv_producer", extra_config=None, block_size=16):
+         config = MagicMock()
+         config.kv_transfer_config.kv_role = kv_role
+@@ -172,6 +178,7 @@ class TestKVPoolScheduler(unittest.TestCase):
+     def test_get_num_new_matched_tokens_less_than_computed(self, mock_client_cls):
+         config = self._make_config(block_size=16)
+         scheduler = KVPoolScheduler(config, use_layerwise=False)
++        self._enable_metrics(scheduler)
+         mock_client_cls.return_value.lookup.return_value = 16
+ 
+         request = MagicMock()
+@@ -182,6 +189,7 @@ class TestKVPoolScheduler(unittest.TestCase):
+ 
+         need, _ = scheduler.get_num_new_matched_tokens(request, 32)
+         self.assertEqual(need, 0)
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 32))
+ 
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+     def test_update_state_after_alloc_no_load_spec(self, mock_client_cls):
+@@ -294,6 +302,162 @@ class TestKVPoolScheduler(unittest.TestCase):
+         self.assertEqual(need, 48)
+         self.assertTrue(is_async)
+ 
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_uses_raw_full_hit_and_emits_after_alloc(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
++        writer = self._enable_metrics(scheduler)
++        mock_client_cls.return_value.lookup.return_value = 64
++        request = MagicMock()
++        request.prompt_token_ids = list(range(64))
++        request.num_tokens = 64
++        request.request_id = "r1"
++        request.block_hashes = [b"h"] * 4
++
++        need, _ = scheduler.get_num_new_matched_tokens(request, 0)
++        self.assertEqual(need, 63)
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 64))
++
++        blocks = MagicMock()
++        blocks.get_block_ids.return_value = [[0, 1, 2, 3]]
++        scheduler.update_state_after_alloc(request, blocks, 63)
++        scheduler.update_state_after_alloc(request, blocks, 63)
++
++        writer.write.assert_called_once_with(
++            "p_kv_hit",
++            request_id="r1",
++            request_tokens=64,
++            hit_tokens=64,
++        )
++        self.assertNotIn("r1", scheduler._pending_p_kv_hit_metrics)
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_deduplicates_local_and_pool_hits(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
++        self._enable_metrics(scheduler)
++        mock_client_cls.return_value.lookup.return_value = 48
++        request = MagicMock()
++        request.prompt_token_ids = list(range(64))
++        request.num_tokens = 64
++        request.request_id = "r1"
++        request.block_hashes = [b"h"] * 4
++
++        scheduler.get_num_new_matched_tokens(request, 16)
++
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 48))
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_records_cold_miss(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
++        writer = self._enable_metrics(scheduler)
++        mock_client_cls.return_value.lookup.return_value = 0
++        request = MagicMock()
++        request.prompt_token_ids = list(range(64))
++        request.num_tokens = 64
++        request.request_id = "r1"
++        request.block_hashes = [b"h"] * 4
++
++        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (64, 0))
++
++        scheduler.update_state_after_alloc(request, MagicMock(), 0)
++
++        writer.write.assert_called_once_with(
++            "p_kv_hit",
++            request_id="r1",
++            request_tokens=64,
++            hit_tokens=0,
++        )
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_records_local_hit_when_pool_lookup_is_skipped(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(block_size=64), use_layerwise=False)
++        writer = self._enable_metrics(scheduler)
++        request = MagicMock()
++        request.prompt_token_ids = list(range(32))
++        request.num_tokens = 32
++        request.request_id = "r1"
++
++        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 16), (0, False))
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (32, 16))
++
++        scheduler.update_state_after_alloc(request, MagicMock(), 0)
++
++        writer.write.assert_called_once_with(
++            "p_kv_hit",
++            request_id="r1",
++            request_tokens=32,
++            hit_tokens=16,
++        )
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_reflects_block_granularity(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(block_size=128), use_layerwise=False)
++        self._enable_metrics(scheduler)
++        mock_client_cls.return_value.lookup.return_value = 896
++        request = MagicMock()
++        request.prompt_token_ids = list(range(1000))
++        request.num_tokens = 1000
++        request.request_id = "r1"
++        request.block_hashes = [b"h"] * 7
++
++        need, _ = scheduler.get_num_new_matched_tokens(request, 0)
++
++        self.assertEqual(need, 896)
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics["r1"], (1000, 896))
++        mock_client_cls.return_value.lookup.assert_called_once_with(
++            896,
++            request.block_hashes,
++            [0],
++            hbm_hit_tokens=0,
++        )
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_retry_overwrites_pending_value(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
++        self._enable_metrics(scheduler)
++        mock_client_cls.return_value.lookup.side_effect = [48, 32]
++        request = MagicMock()
++        request.prompt_token_ids = list(range(64))
++        request.num_tokens = 64
++        request.request_id = "r1"
++        request.block_hashes = [b"h"] * 4
++
++        scheduler.get_num_new_matched_tokens(request, 16)
++        scheduler.get_num_new_matched_tokens(request, 16)
++
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics, {"r1": (64, 32)})
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_is_not_recorded_on_consumer(self, mock_client_cls):
++        scheduler = KVPoolScheduler(self._make_config(kv_role="kv_consumer"), use_layerwise=False)
++        request = MagicMock()
++        request.prompt_token_ids = list(range(64))
++        request.request_id = "r1"
++
++        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
++        scheduler.update_state_after_alloc(request, MagicMock(), 0)
++
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics, {})
++
++    @patch(
++        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.create_p_kv_metric_writer",
++        return_value=None,
++    )
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_p_kv_hit_metric_is_not_staged_when_disabled(self, mock_client_cls, _mock_writer_factory):
++        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
++        self.assertIsNone(scheduler._kv_metric_writer)
++        mock_client_cls.return_value.lookup.return_value = 32
++        request = MagicMock()
++        request.prompt_token_ids = list(range(64))
++        request.num_tokens = 64
++        request.request_id = "r1"
++        request.block_hashes = [b"h"] * 4
++
++        scheduler.get_num_new_matched_tokens(request, 0)
++
++        self.assertEqual(scheduler._pending_p_kv_hit_metrics, {})
++
+ 
+ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+     def _make_config(self, kv_role="kv_producer", block_size=16):
+@@ -367,6 +531,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+             allocated_block_ids=[0, 1],
+         )
+         scheduler._unfinished_requests["r1"] = (MagicMock(), [0, 1])
++        scheduler._pending_p_kv_hit_metrics["r1"] = (32, 16)
+         scheduler._unfinished_request_ids.add("r1")
+ 
+         sched_output = MagicMock()
+@@ -379,6 +544,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+ 
+         _meta = scheduler.build_connector_meta(sched_output)
+         self.assertNotIn("r1", scheduler._request_trackers)
++        self.assertNotIn("r1", scheduler._pending_p_kv_hit_metrics)
+ 
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+     def test_build_connector_meta_consumer_skip_save(self, mock_client_cls):
+@@ -421,6 +587,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+             allocated_block_ids=[0, 1],
+         )
+         scheduler._unfinished_requests["r1"] = (MagicMock(), [0, 1])
++        scheduler._pending_p_kv_hit_metrics["r1"] = (32, 16)
+ 
+         sched_output = MagicMock()
+         sched_output.finished_req_ids = set()
+@@ -432,6 +599,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+ 
+         _meta = scheduler.build_connector_meta(sched_output)
+         self.assertNotIn("r1", scheduler._request_trackers)
++        self.assertNotIn("r1", scheduler._pending_p_kv_hit_metrics)
+ 
+ 
+ class TestLookupKeyClient(unittest.TestCase):
+diff --git a/tools/extract_p_kv_metrics.py b/tools/extract_p_kv_metrics.py
+new file mode 100644
+index 00000000..f7dff816
+--- /dev/null
++++ b/tools/extract_p_kv_metrics.py
+@@ -0,0 +1,203 @@
++#!/usr/bin/env python3
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++
++def _percentile(values: list[float], percentile: float) -> float | None:
++    if not values:
++        return None
++    ordered = sorted(values)
++    position = (len(ordered) - 1) * percentile
++    lower = int(position)
++    upper = min(lower + 1, len(ordered) - 1)
++    fraction = position - lower
++    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
++
++
++def summarize_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
++    hit_events: dict[str, dict[str, Any]] = {}
++    read_events: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
++    duplicate_hit_events = 0
++
++    for record in records:
++        request_id = record.get("request_id")
++        if not isinstance(request_id, str) or not request_id:
++            continue
++        if record.get("event") == "p_kv_hit":
++            if request_id in hit_events:
++                duplicate_hit_events += 1
++            if request_id not in hit_events or int(record.get("timestamp_ns", 0)) >= int(
++                hit_events[request_id].get("timestamp_ns", 0)
++            ):
++                hit_events[request_id] = record
++        elif record.get("event") == "p_kv_read":
++            read_events[request_id].append(record)
++
++    rows: list[dict[str, Any]] = []
++    for request_id in sorted(set(hit_events) | set(read_events)):
++        hit = hit_events.get(request_id, {})
++        reads = read_events.get(request_id, [])
++        read_times_ms = [max(int(item.get("read_time_ns", 0)), 0) / 1_000_000 for item in reads]
++        outcomes = {str(item.get("outcome", "unknown")) for item in reads}
++        if "failed" in outcomes:
++            read_outcome = "failed"
++        elif "ok" in outcomes:
++            read_outcome = "ok"
++        elif outcomes == {"empty"}:
++            read_outcome = "empty"
++        else:
++            read_outcome = "missing"
++
++        request_tokens = hit.get("request_tokens")
++        hit_tokens = hit.get("hit_tokens")
++        hit_ratio = (
++            int(hit_tokens) / int(request_tokens)
++            if request_tokens is not None and hit_tokens is not None and int(request_tokens) > 0
++            else None
++        )
++        rows.append(
++            {
++                "request_id": request_id,
++                "request_tokens": request_tokens,
++                "hit_tokens": hit_tokens,
++                "hit_ratio": hit_ratio,
++                "scheduled_read_tokens": max(
++                    (int(item.get("scheduled_read_tokens", 0)) for item in reads),
++                    default=None,
++                ),
++                "read_time_ms_max_rank": max(read_times_ms, default=None),
++                "read_time_ms_sum_ranks": sum(read_times_ms) if reads else None,
++                "read_rank_events": len(reads),
++                "read_outcome": read_outcome,
++                "read_modes": "|".join(sorted({str(item.get("mode", "unknown")) for item in reads})),
++                "shared_batch_timing": any(item.get("timing_scope") == "shared_batch" for item in reads),
++                "max_batch_size": max((int(item.get("max_batch_size", 0)) for item in reads), default=None),
++            }
++        )
++
++    total_request_tokens = sum(int(row["request_tokens"]) for row in rows if row["request_tokens"] is not None)
++    total_hit_tokens = sum(int(row["hit_tokens"]) for row in rows if row["hit_tokens"] is not None)
++    ok_read_times = [
++        float(row["read_time_ms_max_rank"])
++        for row in rows
++        if row["read_outcome"] == "ok" and row["read_time_ms_max_rank"] is not None
++    ]
++    summary = {
++        "hit_request_count": len(hit_events),
++        "read_request_count": len(read_events),
++        "joined_request_count": len(set(hit_events) & set(read_events)),
++        "duplicate_hit_event_count": duplicate_hit_events,
++        "total_request_tokens": total_request_tokens,
++        "total_hit_tokens": total_hit_tokens,
++        "weighted_hit_ratio": total_hit_tokens / total_request_tokens if total_request_tokens else None,
++        "read_outcome_counts": {
++            outcome: sum(row["read_outcome"] == outcome for row in rows)
++            for outcome in ("ok", "failed", "empty", "missing")
++        },
++        "ok_read_time_ms_max_rank": {
++            "count": len(ok_read_times),
++            "total": sum(ok_read_times),
++            "mean": sum(ok_read_times) / len(ok_read_times) if ok_read_times else None,
++            "p50": _percentile(ok_read_times, 0.50),
++            "p95": _percentile(ok_read_times, 0.95),
++            "p99": _percentile(ok_read_times, 0.99),
++            "max": max(ok_read_times, default=None),
++        },
++        "interpretation": {
++            "hit_tokens": "Deduplicated P-side prefix frontier: max(local HBM hit, KV Pool hit).",
++            "scheduled_read_tokens": "Planned external transfer range, not confirmed successful tokens.",
++            "read_time_ms_max_rank": "Maximum observed external read/copy call time across ranks for the request.",
++            "shared_batch_timing": (
++                "True means the measured call served multiple requests and is not exclusively attributable."
++            ),
++        },
++    }
++    return rows, summary
++
++
++def load_records(input_dir: Path) -> tuple[list[dict[str, Any]], list[str], int]:
++    paths = sorted(input_dir.rglob("p_kv_metrics.*.jsonl"))
++    records: list[dict[str, Any]] = []
++    invalid_lines = 0
++    for path in paths:
++        with path.open(encoding="utf-8") as source:
++            for line in source:
++                try:
++                    record = json.loads(line)
++                except json.JSONDecodeError:
++                    invalid_lines += 1
++                    continue
++                if isinstance(record, dict):
++                    records.append(record)
++                else:
++                    invalid_lines += 1
++    return records, [str(path) for path in paths], invalid_lines
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Aggregate P-side KV hit and external-read JSONL metrics.")
++    parser.add_argument("--input-dir", type=Path, required=True, help="Directory containing p_kv_metrics.*.jsonl")
++    parser.add_argument("--output-dir", type=Path, help="Report directory; defaults to <input-dir>/report")
++    args = parser.parse_args()
++
++    output_dir = args.output_dir or args.input_dir / "report"
++    output_dir.mkdir(parents=True, exist_ok=True)
++    records, input_files, invalid_lines = load_records(args.input_dir)
++    rows, summary = summarize_records(records)
++    summary["input_files"] = input_files
++    summary["invalid_jsonl_line_count"] = invalid_lines
++
++    csv_path = output_dir / "p_kv_request_metrics.csv"
++    fields = list(rows[0]) if rows else [
++        "request_id",
++        "request_tokens",
++        "hit_tokens",
++        "hit_ratio",
++        "scheduled_read_tokens",
++        "read_time_ms_max_rank",
++        "read_time_ms_sum_ranks",
++        "read_rank_events",
++        "read_outcome",
++        "read_modes",
++        "shared_batch_timing",
++        "max_batch_size",
++    ]
++    with csv_path.open("w", encoding="utf-8", newline="") as output:
++        writer = csv.DictWriter(output, fieldnames=fields)
++        writer.writeheader()
++        writer.writerows(rows)
++
++    summary_path = output_dir / "p_kv_summary.json"
++    with summary_path.open("w", encoding="utf-8") as output:
++        json.dump(summary, output, ensure_ascii=False, indent=2)
++        output.write("\n")
++
++    print(f"wrote {csv_path}")
++    print(f"wrote {summary_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_metrics.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_metrics.py
+new file mode 100644
+index 00000000..fb190df8
+--- /dev/null
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_metrics.py
+@@ -0,0 +1,79 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++from __future__ import annotations
++
++import json
++import os
++import socket
++import threading
++import time
++from pathlib import Path
++from typing import Any
++
++from vllm.logger import logger
++
++from vllm_ascend import envs
++
++
++class KVMetricWriter:
++    """Write one P-side KV metric event per JSONL line."""
++
++    def __init__(self, component: str) -> None:
++        output_dir = Path(envs.VLLM_ASCEND_KV_METRICS_DIR).expanduser()
++        output_dir.mkdir(parents=True, exist_ok=True)
++        self.hostname = socket.gethostname()
++        self.pid = os.getpid()
++        self.path = output_dir / f"p_kv_metrics.{component}.{self.hostname}.{self.pid}.jsonl"
++        self._lock = threading.Lock()
++        self._write_failed = False
++
++    def write(self, event: str, **fields: Any) -> None:
++        if self._write_failed:
++            return
++        record = {
++            "timestamp_ns": time.time_ns(),
++            "event": event,
++            "hostname": self.hostname,
++            "pid": self.pid,
++            **fields,
++        }
++        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
++        try:
++            with self._lock, self.path.open("a", encoding="utf-8") as output:
++                output.write(line)
++        except OSError:
++            self._write_failed = True
++            logger.exception("Disabling P-side KV metrics after failing to write %s", self.path)
++
++
++def create_p_kv_metric_writer(component: str, kv_role: str) -> KVMetricWriter | None:
++    if kv_role != "kv_producer" or not envs.VLLM_ASCEND_KV_METRICS:
++        return None
++    return KVMetricWriter(component)
++
++
++def get_scheduled_read_tokens(request: Any) -> int:
++    load_spec = request.load_spec
++    if load_spec is None:
++        return 0
++    read_end = int(
++        load_spec.token_len
++        or load_spec.kvpool_store_skip_tokens
++        or load_spec.kvpool_cached_tokens
++    )
++    return max(read_end - int(load_spec.vllm_cached_tokens), 0)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index 1659116f..009d7c6a 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+@@ -14,6 +14,10 @@ from vllm.logger import logger
+ from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
++    KVMetricWriter,
++    get_scheduled_read_tokens,
++)
+ 
+ # isort: off
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+@@ -312,6 +316,9 @@ class KVTransferThread(threading.Thread):
+         dcp_size: int = 1,
+         ready_event: threading.Event | None = None,
+         name: str = "KVTransferThread",
++        kv_metric_writer: KVMetricWriter | None = None,
++        kv_metric_dp_rank: int = 0,
++        kv_metric_pp_rank: int = 0,
+     ):
+         super().__init__(daemon=True, name=name)
+         self.m_store = m_store
+@@ -328,6 +335,58 @@ class KVTransferThread(threading.Thread):
+         self.finished_requests: set[str] = set()
+         self.kv_event_lock = threading.Lock()
+         self.kv_events: list[BlockStored] = []
++        self.kv_metric_writer = kv_metric_writer
++        self.kv_metric_dp_rank = kv_metric_dp_rank
++        self.kv_metric_pp_rank = kv_metric_pp_rank
++        self._kv_read_elapsed_ns: dict[str, int] = {}
++        self._kv_read_call_count: defaultdict[str, int] = defaultdict(int)
++        self._kv_read_max_batch_size: defaultdict[str, int] = defaultdict(int)
++        self._kv_read_failed_requests: set[str] = set()
++
++    def record_kv_read_metrics(
++        self,
++        requests: list[ReqMeta],
++        elapsed_ns: int,
++        mode: str,
++        outcome: str,
++        final: bool,
++    ) -> None:
++        if self.kv_metric_writer is None:
++            return
++        unique_requests = {request.req_id: request for request in requests}
++        batch_size = len(unique_requests)
++        for req_id, request in unique_requests.items():
++            self._kv_read_elapsed_ns[req_id] = self._kv_read_elapsed_ns.get(req_id, 0) + elapsed_ns
++            if outcome != "empty":
++                self._kv_read_call_count[req_id] += 1
++            self._kv_read_max_batch_size[req_id] = max(self._kv_read_max_batch_size[req_id], batch_size)
++            if outcome == "failed":
++                self._kv_read_failed_requests.add(req_id)
++            if not final:
++                continue
++
++            total_elapsed_ns = self._kv_read_elapsed_ns.pop(req_id, 0)
++            read_call_count = self._kv_read_call_count.pop(req_id, 0)
++            max_batch_size = self._kv_read_max_batch_size.pop(req_id, 0)
++            if req_id in self._kv_read_failed_requests:
++                final_outcome = "failed"
++                self._kv_read_failed_requests.discard(req_id)
++            else:
++                final_outcome = "ok" if read_call_count else "empty"
++            self.kv_metric_writer.write(
++                "p_kv_read",
++                request_id=req_id,
++                scheduled_read_tokens=get_scheduled_read_tokens(request),
++                read_time_ns=total_elapsed_ns,
++                mode=mode,
++                outcome=final_outcome,
++                dp_rank=self.kv_metric_dp_rank,
++                pp_rank=self.kv_metric_pp_rank,
++                tp_rank=self.tp_rank,
++                read_call_count=read_call_count,
++                max_batch_size=max_batch_size,
++                timing_scope="shared_batch" if max_batch_size > 1 else "request",
++            )
+ 
+     def _get_block_size(self, kv_cache_group_id: int = 0) -> int:
+         if isinstance(self.block_size, list):
+@@ -363,6 +422,11 @@ class KVTransferThread(threading.Thread):
+     def discard_finished_requests(self, req_ids: set[str]) -> None:
+         with self.done_task_lock:
+             self.finished_requests -= req_ids
++        for req_id in req_ids:
++            self._kv_read_elapsed_ns.pop(req_id, None)
++            self._kv_read_call_count.pop(req_id, None)
++            self._kv_read_max_batch_size.pop(req_id, None)
++            self._kv_read_failed_requests.discard(req_id)
+ 
+     def set_finished_request(self, req_id):
+         with self.done_task_lock:
+@@ -853,6 +917,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+         ready_event: threading.Event | None = None,
+         invalid_block_ids: set[int] | None = None,
+         invalid_block_ids_lock: threading.Lock | None = None,
++        kv_metric_writer: KVMetricWriter | None = None,
++        kv_metric_dp_rank: int = 0,
++        kv_metric_pp_rank: int = 0,
+     ):
+         super().__init__(
+             m_store,
+@@ -863,6 +930,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+             dcp_size,
+             ready_event,
+             name="KVCacheStoreRecvingThread",
++            kv_metric_writer=kv_metric_writer,
++            kv_metric_dp_rank=kv_metric_dp_rank,
++            kv_metric_pp_rank=kv_metric_pp_rank,
+         )
+         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
+         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
+@@ -915,6 +985,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 size_list.append(size)
+                 block_id_list.append(block_id)
+         if not key_list:
++            self.record_kv_read_metrics([req_meta], 0, "async", "empty", final=True)
+             self.set_finished_request(req_id)
+             self.request_queue.task_done()
+             return
+@@ -932,8 +1003,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+             len(key_list_c),
+             key_list_c[:3],
+         )
++        read_start_ns = time.perf_counter_ns() if self.kv_metric_writer is not None else 0
+         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
++        read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self.kv_metric_writer is not None else 0
++        outcome = "ok"
+         if ret is not None and any(r != 0 for r in ret):
++            outcome = "failed"
+             missing_block_ids = record_failed_blocks(
+                 block_id_list_c,
+                 ret,
+@@ -950,6 +1025,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                     missing_block_ids,
+                 )
+         elif ret is None:
++            outcome = "failed"
+             missing_block_ids = record_failed_blocks(
+                 block_id_list_c,
+                 [1] * len(block_id_list_c),
+@@ -972,6 +1048,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+             req_meta.kv_cache_group_ids or [0],
+             len(key_list_c),
+         )
++        self.record_kv_read_metrics([req_meta], read_elapsed_ns, "async", outcome, final=True)
+         self.set_finished_request(req_id)
+         self.request_queue.task_done()
+ 
+@@ -1149,6 +1226,9 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
+         layer_load_finished_events: list[threading.Event],
+         layer_save_finished_events: list[threading.Event],
+         num_layers: int,
++        kv_metric_writer: KVMetricWriter | None = None,
++        kv_metric_dp_rank: int = 0,
++        kv_metric_pp_rank: int = 0,
+     ):
+         super().__init__(
+             m_store,
+@@ -1159,6 +1239,9 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
+             dcp_size,
+             ready_event,
+             name="KVCacheStoreKeyLayerRecvingThread",
++            kv_metric_writer=kv_metric_writer,
++            kv_metric_dp_rank=kv_metric_dp_rank,
++            kv_metric_pp_rank=kv_metric_pp_rank,
+         )
+         self.get_event = get_event
+         self.layer_load_finished_events = layer_load_finished_events
+@@ -1193,12 +1276,14 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
+         size_list = []
+         req_ids = []
+         is_last_chunks = []
++        requests: list[ReqMeta] = []
+         if len(data.transfer_tasks) > 1:
+             raise ValueError(f"Expected at most one layer transfer task, got {len(data.transfer_tasks)}")
+         if data.transfer_tasks:
+             transfer_task = data.transfer_tasks[0]
+             for block_range in transfer_task.block_ranges:
+                 request = block_range.request
++                requests.append(request)
+                 req_ids.append(request.req_id)
+                 is_last_chunks.append(request.is_last_chunk)
+                 for block_index in range(block_range.start_block, block_range.end_block):
+@@ -1222,12 +1307,25 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
+                     addr_list.append(addr)
+                     size_list.append(size)
+ 
++        read_elapsed_ns = 0
++        outcome = "empty"
+         if key_list:
+             shift = (self.tp_rank * len(key_list)) // self.tp_size
+             key_list_c = _circular_shift(key_list, shift)
+             addr_list_c = _circular_shift(addr_list, shift)
+             size_list_c = _circular_shift(size_list, shift)
+-            self.m_store.get(key_list_c, addr_list_c, size_list_c)
++            read_start_ns = time.perf_counter_ns() if self.kv_metric_writer is not None else 0
++            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
++            read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self.kv_metric_writer is not None else 0
++            outcome = "failed" if ret is None or any(result != 0 for result in ret) else "ok"
++
++        self.record_kv_read_metrics(
++            requests,
++            read_elapsed_ns,
++            "layerwise_key",
++            outcome,
++            final=layer_id == self.final_layer_id,
++        )
+ 
+         if layer_id == self.final_layer_id:
+             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
+@@ -1262,6 +1360,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
+         max_transfer_blocks: int = 0,
+         max_transfer_bytes: int = 0,
+         group_builders: list[LayerBatchBuilder] | None = None,
++        kv_metric_writer: KVMetricWriter | None = None,
++        kv_metric_dp_rank: int = 0,
++        kv_metric_pp_rank: int = 0,
+     ):
+         super().__init__(
+             m_store,
+@@ -1429,6 +1530,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+             dcp_size,
+             ready_event,
+             name="KVCacheStoreLayerRecvingThread",
++            kv_metric_writer=kv_metric_writer,
++            kv_metric_dp_rank=kv_metric_dp_rank,
++            kv_metric_pp_rank=kv_metric_pp_rank,
+         )
+         self.get_event = get_event
+         self.layer_load_finished_events = layer_load_finished_events
+@@ -1484,6 +1588,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+         transfer_tasks = data.transfer_tasks
+         layer_id = data.layer_id
+         attention_start_gate = data.attention_start_gate
++        requests = [block_range.request for task in transfer_tasks for block_range in task.block_ranges]
+ 
+         if len(transfer_tasks) == 0:
+             if wait_for_save is not None:
+@@ -1511,6 +1616,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+                 task_metas.append((task, req_meta))
+ 
+         if not task_metas:
++            self.record_kv_read_metrics(
++                requests,
++                0,
++                "layerwise_gva",
++                "empty",
++                final=layer_id == self.final_layer_id,
++            )
+             assert not self.layer_load_finished_events[layer_id].is_set()
+             logger.debug("Layer load event set: layer %d", layer_id)
+             self.layer_load_finished_events[layer_id].set()
+@@ -1548,13 +1660,28 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+         gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
+         addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
+         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
+-        res = self._batch_copy_with_limits(
+-            gvas_array,
+-            addr_array,
+-            size_array,
+-            1,
+-            self.max_transfer_blocks,
+-            self.max_transfer_bytes,
++        read_elapsed_ns = 0
++        outcome = "empty"
++        if len(gvas_array):
++            read_start_ns = time.perf_counter_ns() if self.kv_metric_writer is not None else 0
++            res = self._batch_copy_with_limits(
++                gvas_array,
++                addr_array,
++                size_array,
++                1,
++                self.max_transfer_blocks,
++                self.max_transfer_bytes,
++            )
++            read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self.kv_metric_writer is not None else 0
++            outcome = "ok" if res == 0 else "failed"
++        else:
++            res = 0
++        self.record_kv_read_metrics(
++            requests,
++            read_elapsed_ns,
++            "layerwise_gva",
++            outcome,
++            final=layer_id == self.final_layer_id,
+         )
+         if layer_id <= 2 or res != 0:
+             logger.debug(
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index 6f258bc6..4c71da37 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -42,6 +42,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
+     infer_group_cache_families,
+     normalize_block_ids_by_group,
+ )
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
++    KVMetricWriter,
++    create_p_kv_metric_writer,
++)
+ 
+ 
+ class KVPoolScheduler:
+@@ -130,6 +134,21 @@ class KVPoolScheduler:
+             self._discard_partial_chunks = vllm_config.kv_transfer_config.get_from_extra_config(
+                 "discard_partial_chunks", True
+             )
++        # request_id -> (prompt tokens, deduplicated KV hit tokens)
++        self._pending_p_kv_hit_metrics: dict[str, tuple[int, int]] = {}
++        self._kv_metric_writer: KVMetricWriter | None = create_p_kv_metric_writer("scheduler", self.kv_role)
++        if self._kv_metric_writer is not None:
++            self._kv_metric_writer.write(
++                "p_kv_config",
++                component="scheduler",
++                block_sizes=self.original_block_size,
++                cache_transfer_granularity=self.cache_transfer_granularity,
++                discard_partial_chunks=self._discard_partial_chunks,
++            )
++            logger.info(
++                "P-side KV metrics enabled; scheduler output=%s",
++                self._kv_metric_writer.path,
++            )
+         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
+         self._unfinished_request_ids: set[str] = set()
+         self._loading_req_ids: set[str] = set()
+@@ -428,6 +447,37 @@ class KVPoolScheduler:
+     def _floor_to_cache_transfer_granularity(self, token_len: int) -> int:
+         return token_len // self.cache_transfer_granularity * self.cache_transfer_granularity
+ 
++    def _stage_p_kv_hit_metric(
++        self,
++        request: "Request",
++        local_hit_tokens: int,
++        pool_hit_tokens: int,
++    ) -> None:
++        if self._kv_metric_writer is None:
++            return
++        request_tokens = len(request.prompt_token_ids)
++        hit_tokens = min(
++            request_tokens,
++            max(max(int(local_hit_tokens), 0), max(int(pool_hit_tokens), 0)),
++        )
++        self._pending_p_kv_hit_metrics[request.request_id] = (
++            request_tokens,
++            hit_tokens,
++        )
++
++    def _emit_p_kv_hit_metric(self, request_id: str) -> None:
++        metric = self._pending_p_kv_hit_metrics.pop(request_id, None)
++        if metric is None:
++            return
++        request_tokens, hit_tokens = metric
++        assert self._kv_metric_writer is not None
++        self._kv_metric_writer.write(
++            "p_kv_hit",
++            request_id=request_id,
++            request_tokens=request_tokens,
++            hit_tokens=hit_tokens,
++        )
++
+     @staticmethod
+     def _uses_hybrid_kv_cache(vllm_config: "VllmConfig", kv_cache_config: KVCacheConfig | None) -> bool:
+         if kv_cache_config is None:
+@@ -514,6 +564,7 @@ class KVPoolScheduler:
+             and not self.use_layerwise
+             and prompt_token_len < 2 * self.retention_interval
+         ):
++            self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
+             return 0, False
+ 
+         if self.use_gva_layerwise:
+@@ -526,6 +577,7 @@ class KVPoolScheduler:
+                 token_len = prompt_token_len
+ 
+             if token_len < self.cache_transfer_granularity:
++                self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
+                 return 0, False
+ 
+             if self.use_layerwise:
+@@ -534,6 +586,7 @@ class KVPoolScheduler:
+                 )
+             else:
+                 if num_computed_tokens >= token_len:
++                    self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
+                     return 0, False
+                 if self.client is None:
+                     self.client = LookupKeyClient(self.vllm_config)
+@@ -545,9 +598,11 @@ class KVPoolScheduler:
+                 )
+ 
+         if num_external_hit_tokens == 0:
++            self._stage_p_kv_hit_metric(request, num_computed_tokens, 0)
+             return 0, False
+ 
+         store_skip_tokens = num_external_hit_tokens
++        self._stage_p_kv_hit_metric(request, num_computed_tokens, store_skip_tokens)
+         if num_external_hit_tokens == request.num_tokens:
+             num_external_hit_tokens -= 1
+ 
+@@ -603,6 +658,7 @@ class KVPoolScheduler:
+ 
+         self._unfinished_requests[request.request_id] = (request, local_block_ids)
+         self._unfinished_request_ids.add(request.request_id)
++        self._emit_p_kv_hit_metric(request.request_id)
+         if request.request_id not in self.load_specs:
+             # No KV tokens from external KV cache, return
+             logger.debug(
+@@ -920,6 +976,7 @@ class KVPoolScheduler:
+         force_skip_save = self.kv_role == "kv_consumer" and not self.consumer_is_to_put
+ 
+         for finished_req_id in scheduler_output.finished_req_ids:
++            self._pending_p_kv_hit_metrics.pop(finished_req_id, None)
+             self._request_trackers.pop(finished_req_id, None)
+             self._unfinished_requests.pop(finished_req_id, None)
+             self._unfinished_request_ids.discard(finished_req_id)
+@@ -928,6 +985,7 @@ class KVPoolScheduler:
+ 
+         for req_id in scheduler_output.preempted_req_ids:
+             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
++            self._pending_p_kv_hit_metrics.pop(req_id, None)
+             self._request_trackers.pop(req_id, None)
+             self._unfinished_requests.pop(req_id, None)
+             self._loading_req_ids.discard(req_id)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 1bda6de2..4b3eba10 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import importlib
+ import math
+ import threading
++import time
+ from collections.abc import Generator
+ from typing import Any
+ 
+@@ -50,6 +51,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
+     AscendStoreCoordinator,
+     ExternalCachedBlockPool,
+ )
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_metrics import (
++    KVMetricWriter,
++    create_p_kv_metric_writer,
++    get_scheduled_read_tokens,
++)
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+     KVCacheStoreKeyLayerRecvingThread,
+     KVCacheStoreKeyLayerSendingThread,
+@@ -133,6 +139,22 @@ class KVPoolWorker:
+         self.use_layerwise = use_layerwise
+         self.kv_role = vllm_config.kv_transfer_config.kv_role
+         self.load_async = extra_config.get("load_async", False)
++        self._kv_metric_writer: KVMetricWriter | None = create_p_kv_metric_writer("worker", self.kv_role)
++        if self._kv_metric_writer is not None:
++            self._kv_metric_writer.write(
++                "p_kv_config",
++                component="worker",
++                backend=extra_config.get("backend", "mooncake"),
++                load_async=self.load_async,
++                use_layerwise=self.use_layerwise,
++                dp_rank=self.dp_rank,
++                pp_rank=self.pp_rank,
++                tp_rank=self.tp_rank,
++            )
++            logger.info(
++                "P-side KV metrics enabled; worker output=%s",
++                self._kv_metric_writer.path,
++            )
+         self._invalid_block_ids: set[int] = set()
+         self._invalid_block_ids_lock = threading.Lock()
+         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
+@@ -345,6 +367,9 @@ class KVPoolWorker:
+                     self.layerwise_max_transfer_blocks,
+                     self.layerwise_max_transfer_bytes,
+                     group_builders=self._build_group_layer_builders(),
++                    kv_metric_writer=self._kv_metric_writer,
++                    kv_metric_dp_rank=self.dp_rank,
++                    kv_metric_pp_rank=self.pp_rank,
+                 )
+                 self.kv_send_thread.start()
+                 ready_event_sending.wait()
+@@ -400,6 +425,9 @@ class KVPoolWorker:
+                     self.layer_load_finished_events,
+                     self.layer_save_finished_events,
+                     self.num_layers,
++                    kv_metric_writer=self._kv_metric_writer,
++                    kv_metric_dp_rank=self.dp_rank,
++                    kv_metric_pp_rank=self.pp_rank,
+                 )
+             self.kv_recv_thread.start()
+             ready_event.wait()
+@@ -433,6 +461,9 @@ class KVPoolWorker:
+                     ready_event,
+                     invalid_block_ids=self._invalid_block_ids,
+                     invalid_block_ids_lock=self._invalid_block_ids_lock,
++                    kv_metric_writer=self._kv_metric_writer,
++                    kv_metric_dp_rank=self.dp_rank,
++                    kv_metric_pp_rank=self.pp_rank,
+                 )
+                 self.kv_recv_thread.start()
+                 ready_event.wait()
+@@ -828,6 +859,21 @@ class KVPoolWorker:
+                     size_list.append(size)
+                     block_id_list.append(block_id)
+             if not key_list:
++                if self._kv_metric_writer is not None:
++                    self._kv_metric_writer.write(
++                        "p_kv_read",
++                        request_id=request.req_id,
++                        scheduled_read_tokens=get_scheduled_read_tokens(request),
++                        read_time_ns=0,
++                        mode="sync",
++                        outcome="empty",
++                        dp_rank=self.dp_rank,
++                        pp_rank=self.pp_rank,
++                        tp_rank=self.tp_rank,
++                        read_call_count=0,
++                        max_batch_size=1,
++                        timing_scope="request",
++                    )
+                 continue
+             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
+             addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
+@@ -841,8 +887,12 @@ class KVPoolWorker:
+                 len(key_list_c),
+                 key_list_c[:3],
+             )
++            read_start_ns = time.perf_counter_ns() if self._kv_metric_writer is not None else 0
+             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
++            read_elapsed_ns = time.perf_counter_ns() - read_start_ns if self._kv_metric_writer is not None else 0
++            outcome = "ok"
+             if ret is not None and any(r != 0 for r in ret):
++                outcome = "failed"
+                 missing_block_ids = record_failed_blocks(
+                     block_id_list_c,
+                     ret,
+@@ -858,6 +908,7 @@ class KVPoolWorker:
+                         missing_block_ids,
+                     )
+             elif ret is None:
++                outcome = "failed"
+                 missing_block_ids = record_failed_blocks(
+                     block_id_list_c,
+                     [1] * len(block_id_list_c),
+@@ -879,6 +930,21 @@ class KVPoolWorker:
+                 load_group_ids,
+                 len(key_list_c),
+             )
++            if self._kv_metric_writer is not None:
++                self._kv_metric_writer.write(
++                    "p_kv_read",
++                    request_id=request.req_id,
++                    scheduled_read_tokens=get_scheduled_read_tokens(request),
++                    read_time_ns=read_elapsed_ns,
++                    mode="sync",
++                    outcome=outcome,
++                    dp_rank=self.dp_rank,
++                    pp_rank=self.pp_rank,
++                    tp_rank=self.tp_rank,
++                    read_call_count=1,
++                    max_batch_size=1,
++                    timing_scope="request",
++                )
+ 
+     def _process_save_for_layer_batch(
+         self,
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index 3c8c319c..5d200144 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -110,6 +110,14 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
+     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
++    # Whether to collect P-side KV hit and external-read metrics. 0 disables
++    # collection (the default); 1 enables JSONL output. This is not sensitive.
++    "VLLM_ASCEND_KV_METRICS": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_METRICS", "0"))),
++    # Directory for P-side KV metric JSONL files. It is used only when
++    # VLLM_ASCEND_KV_METRICS=1. This is not sensitive.
++    "VLLM_ASCEND_KV_METRICS_DIR": lambda: os.getenv(
++        "VLLM_ASCEND_KV_METRICS_DIR", "/tmp/vllm_ascend_kv_metrics"
++    ),
+ }
+ 
+ # end-env-vars-definition

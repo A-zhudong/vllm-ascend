@@ -48,8 +48,11 @@ class AscendQosConfigContract(unittest.TestCase):
         math.cdiv = lambda a, b: -(a // -b)
         sys.modules[math.__name__] = math
         hardware: Any = ModuleType("vllm_ascend.device.hardware_profile")
+        hardware.DeviceAdaptorFamily = NS(STANDARD="standard", FP8_OPTIMIZED="fp8_optimized")
         hardware.HardwareCapability = NS(NPUGRAPH_EX="fixture")
-        hardware.get_current_hardware_profile = lambda: NS(supports=lambda cap: False)
+        hardware.get_current_hardware_profile = lambda: NS(
+            supports=lambda cap: False, device_adaptor_family=hardware.DeviceAdaptorFamily.STANDARD
+        )
         sys.modules[hardware.__name__] = hardware
         utils: Any = ModuleType("vllm_ascend.utils")
         utils.clear_enable_sp = lambda: None
